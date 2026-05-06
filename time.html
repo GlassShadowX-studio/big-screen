@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>考试计时器</title>
+  <script src="./gsap/gsap.min.js"></script>
+  <script src="./gsap/TextPlugin.min.js"></script>
+  <script src="./gsap/SplitText.min.js"></script>
+  <style>
+    @font-face {
+      font-family: 'Google Sans Flex';
+      src: url('./googlesansflex.woff') format('woff');
+      font-weight: 400;
+      font-style: normal;
+      font-display: block;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background-color: #f5f5f5;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    .clock-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    #timeDisplay {
+      font-weight: 400;
+      letter-spacing: 0.00em;
+      color: #333333;
+      text-align: center;
+      line-height: 1.1;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+      will-change: transform, filter;
+    }
+
+    .sync-state {
+      font-size: 2.2rem;
+      font-weight: 400;
+      color: #333333;
+      letter-spacing: 0.1em;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    }
+
+    .time-state {
+      font-size: clamp(5rem, 22vw, 20rem);
+      font-weight: 400;
+      color: #333333;
+      letter-spacing: 0.06em;
+      font-family: 'Google Sans Flex', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', monospace;
+    }
+
+    .oh {
+      overflow: hidden;
+    }
+
+    @media (max-width: 600px) {
+      .sync-state {
+        font-size: 1.6rem;
+      }
+      .time-state {
+        font-size: clamp(3.5rem, 18vw, 8rem);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="clock-container">
+    <div id="timeDisplay" class="sync-state">正在同步时间...</div>
+  </div>
+
+  <script>
+    (function() {
+      const display = document.getElementById('timeDisplay');
+      
+      let timeOffset = 0; // 网络时间与本地时间的差值（毫秒）
+      let updateTimer = null;
+      let syncTimer = null;
+      let animating = true;
+      let synced = false; // 是否已成功同步过
+      
+      // 获取当前校准后的北京时间
+      function getCalibratedTime() {
+        const now = Date.now();
+        // 校正后的UTC时间 = 本地时间戳 + 偏移量
+        const correctedUTC = now + timeOffset;
+        // 北京时间 = UTC + 8小时
+        const beijingTime = new Date(correctedUTC + 8 * 60 * 60 * 1000);
+        
+        const h = String(beijingTime.getUTCHours()).padStart(2, '0');
+        const m = String(beijingTime.getUTCMinutes()).padStart(2, '0');
+        const s = String(beijingTime.getUTCSeconds()).padStart(2, '0');
+        return `${h}:${m}:${s}`;
+      }
+
+      // 多个高可用时间API
+      const TIME_APIS = [
+        {
+          name: 'TimeAPI.io',
+          url: 'https://timeapi.io/api/Time/current/zone?timeZone=Asia/Shanghai',
+          getTime: (data) => new Date(data.dateTime).getTime()
+        }
+      ];
+
+      // 从单个API获取时间并计算偏移量
+      async function fetchTimeFromAPI(api) {
+        const startTime = Date.now();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        
+        try {
+          const response = await fetch(api.url, {
+            signal: controller.signal,
+            cache: 'no-store'
+          });
+          clearTimeout(timeout);
+          
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          
+          const data = await response.json();
+          const serverTime = api.getTime(data);
+          const endTime = Date.now();
+          
+          // 考虑网络延迟：取请求中间时刻
+          const midTime = Math.floor((startTime + endTime) / 2);
+          const offset = serverTime - midTime;
+          
+          console.log(`[同步] ${api.name} 成功, 偏移量: ${offset}ms, RTT: ${endTime - startTime}ms`);
+          return offset;
+        } catch (error) {
+          clearTimeout(timeout);
+          console.warn(`[同步] ${api.name} 失败:`, error.message);
+          throw error;
+        }
+      }
+
+      // 同步网络时间
+      async function syncNetworkTime() {
+        const offsets = [];
+        
+        // 尝试所有API
+        for (const api of TIME_APIS) {
+          try {
+            const offset = await fetchTimeFromAPI(api);
+            offsets.push(offset);
+          } catch (e) {
+            // 继续尝试下一个
+          }
+        }
+        
+        if (offsets.length > 0) {
+          // 取中位数避免极端值
+          offsets.sort((a, b) => a - b);
+          const medianOffset = offsets[Math.floor(offsets.length / 2)];
+          
+          // 如果偏差超过1秒才更新（避免频繁微调）
+          if (Math.abs(medianOffset - timeOffset) > 1000 || !synced) {
+            timeOffset = medianOffset;
+          } else {
+            // 渐进调整
+            timeOffset = timeOffset * 0.7 + medianOffset * 0.3;
+          }
+          
+          synced = true;
+          console.log(`[同步完成] 最终偏移量: ${timeOffset}ms, 当前时间: ${getCalibratedTime()}`);
+          return true;
+        } else {
+          console.warn('[同步] 所有API失败，使用本地时间');
+          if (!synced) {
+            timeOffset = 0;
+          }
+          return false;
+        }
+      }
+
+      // 精确走时
+      function startClock() {
+        if (updateTimer) clearTimeout(updateTimer);
+        
+        display.textContent = getCalibratedTime();
+        
+        function scheduleTick() {
+          const now = Date.now();
+          const msToNextSecond = 1000 - (now % 1000);
+          
+          updateTimer = setTimeout(() => {
+            if (!animating) {
+              display.textContent = getCalibratedTime();
+            }
+            scheduleTick();
+          }, msToNextSecond + 5);
+        }
+        
+        scheduleTick();
+      }
+
+      // 毛玻璃模糊退场
+      function animateBlurOut() {
+        return new Promise(resolve => {
+          gsap.to(display, {
+            duration: 0.6,
+            filter: 'blur(16px)',
+            opacity: 0,
+            scale: 1.03,
+            ease: 'power2.in',
+            onComplete: resolve
+          });
+        });
+      }
+
+      // Lines Masking 入场
+      function animateLinesIn() {
+        return new Promise(resolve => {
+          gsap.set(display, { 
+            filter: 'blur(0px)', 
+            opacity: 1, 
+            scale: 1,
+            clearProps: 'all'
+          });
+          
+          display.classList.remove('sync-state');
+          display.classList.add('time-state');
+          
+          const initialTime = getCalibratedTime();
+          display.textContent = initialTime;
+          
+          const split = new SplitText(display, { type: 'lines', linesClass: 'time-line' });
+          new SplitText(display, { type: 'lines', linesClass: 'oh' });
+          
+          gsap.from(split.lines, {
+            y: 100,
+            duration: 0.65,
+            stagger: 0.06,
+            ease: 'power4.out',
+            opacity: 0,
+            onComplete: () => {
+              split.revert();
+              display.textContent = getCalibratedTime();
+              animating = false;
+              resolve();
+            }
+          });
+        });
+      }
+
+      // 字体加载
+      async function ensureFontLoaded() {
+        if (document.fonts && document.fonts.ready) {
+          await document.fonts.ready;
+          try {
+            const font = new FontFace('Google Sans Flex', 'url(./googlesansflex.woff) format("woff")');
+            await font.load();
+            document.fonts.add(font);
+          } catch (e) {
+            console.warn('[字体] 加载失败');
+          }
+        }
+      }
+
+      // 主流程
+      async function init() {
+        // 1. 并行：字体加载 + 时间同步
+        await Promise.all([
+          ensureFontLoaded(),
+          syncNetworkTime()
+        ]);
+        
+        // 2. 短暂显示"正在同步时间..."
+        await new Promise(r => setTimeout(r, 300));
+        
+        // 3. 毛玻璃模糊退场
+        await animateBlurOut();
+        
+        // 4. 清理
+        gsap.set(display, { clearProps: 'all' });
+        
+        // 5. Lines Masking 入场
+        await animateLinesIn();
+        
+        // 6. 启动走时
+        startClock();
+        
+        // 7. 每10分钟后台同步
+        syncTimer = setInterval(async () => {
+          await syncNetworkTime();
+          console.log('[定期同步] 当前时间:', getCalibratedTime());
+        }, 10 * 60 * 1000);
+        
+        console.log('[计时器] 就绪:', getCalibratedTime());
+      }
+
+      // 页面可见性
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          if (updateTimer) {
+            clearTimeout(updateTimer);
+            updateTimer = null;
+          }
+        } else {
+          if (!animating) {
+            syncNetworkTime().then(() => {
+              display.textContent = getCalibratedTime();
+              startClock();
+            });
+          }
+        }
+      });
+
+      // 启动
+      init().catch(e => {
+        console.error('[计时器] 异常:', e);
+        display.textContent = getCalibratedTime();
+        display.classList.remove('sync-state');
+        display.classList.add('time-state');
+        animating = false;
+        startClock();
+      });
+
+      // 清理
+      window.addEventListener('beforeunload', () => {
+        if (updateTimer) clearTimeout(updateTimer);
+        if (syncTimer) clearInterval(syncTimer);
+      });
+    })();
+  </script>
+</body>
+</html>
